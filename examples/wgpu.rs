@@ -1,3 +1,4 @@
+use calloop::{channel::Event, LoopHandle};
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
     WaylandDisplayHandle, WaylandWindowHandle,
@@ -21,15 +22,16 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_seat, wl_surface},
-    Connection, Proxy, QueueHandle,
+    Connection, Proxy, QueueHandle, WaylandSource,
 };
+use wgpu::Instance;
 
 fn main() {
     env_logger::init();
 
     let conn = Connection::connect_to_env().unwrap();
     let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
-    let qh = event_queue.handle();
+    let qh: QueueHandle<Wgpu> = event_queue.handle();
 
     // Initialize xdg_shell handlers so we can select the correct adapter
     let compositor_state =
@@ -45,6 +47,9 @@ fn main() {
     window.set_min_size(Some((256, 256)));
     window.commit();
 
+    let mut event_loop: calloop::EventLoop<'_, Wgpu> = calloop::EventLoop::try_new().unwrap();
+    WaylandSource::new(event_queue).unwrap().insert(event_loop.handle());
+    let (hang_sender, channel2) = calloop::channel::channel();
     // Initialize wgpu
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -83,7 +88,12 @@ fn main() {
     };
 
     let surface = unsafe { instance.create_surface(&handle).unwrap() };
+    event_loop.handle().insert_source(channel2, move |event: Event<()>, _, wgpu| {
+        wgpu.surface = unsafe { wgpu.instance.create_surface(&handle).unwrap() };
+        wgpu.do_render();
+    });
 
+    let signal = event_loop.get_signal();
     // Pick a supported adapter
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         compatible_surface: Some(&surface),
@@ -106,16 +116,17 @@ fn main() {
         device,
         surface,
         adapter,
+        instance,
         queue,
+        hang_sender,
+
+        loop_handle: event_loop.handle(),
     };
 
     // We don't draw immediately, the configure will notify us when to first draw.
-    loop {
-        event_queue.blocking_dispatch(&mut wgpu).unwrap();
-
-        if wgpu.exit {
-            println!("exiting example");
-            break;
+    {
+        while !wgpu.exit {
+            event_loop.dispatch(None, &mut wgpu);
         }
     }
 
@@ -138,6 +149,11 @@ struct Wgpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface,
+
+    loop_handle: LoopHandle<'static, Wgpu>,
+    instance: Instance,
+
+    hang_sender: calloop::channel::Sender<()>,
 }
 
 impl CompositorHandler for Wgpu {
@@ -218,6 +234,13 @@ impl WindowHandler for Wgpu {
         self.width = new_width.map_or(256, |v| v.get());
         self.height = new_height.map_or(256, |v| v.get());
 
+        self.do_render();
+        self.hang_sender.send(());
+    }
+}
+
+impl Wgpu {
+    fn do_render(&mut self) {
         let adapter = &self.adapter;
         let surface = &self.surface;
         let device = &self.device;
